@@ -17,7 +17,10 @@ export async function api<T>(
     },
   });
   if (res.status === 401) {
-    // TODO(M1): redirect to /login
+    localStorage.removeItem("sorted_jwt");
+    if (window.location.pathname !== "/login") {
+      window.location.assign("/login");
+    }
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));

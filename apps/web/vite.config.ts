@@ -16,9 +16,14 @@ export default defineConfig({
         display: "standalone",
         start_url: "/",
         icons: [
-          // TODO(M8): real icons. pwa-asset-generator makes these from one svg.
           { src: "/icon-192.png", sizes: "192x192", type: "image/png" },
           { src: "/icon-512.png", sizes: "512x512", type: "image/png" },
+          {
+            src: "/icon-512.png",
+            sizes: "512x512",
+            type: "image/png",
+            purpose: "maskable",
+          },
         ],
       },
     }),
