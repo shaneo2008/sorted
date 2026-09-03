@@ -1,0 +1,9 @@
+{
+  "name": "sorted",
+  "private": true,
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "dev": "pnpm --filter api dev & pnpm --filter web dev",
+    "typecheck": "pnpm -r typecheck"
+  }
+}
