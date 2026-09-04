@@ -33,6 +33,7 @@ export function AddBooking() {
   );
 
   function update(field: keyof typeof form, value: string) {
+    setError("");
     setForm((current) => ({ ...current, [field]: value }));
   }
 
@@ -234,7 +235,7 @@ export function AddBooking() {
             </>
           )}
         </Card>
-        <div className="sticky-action">
+        <div className={`sticky-action ${error ? "has-error" : ""}`}>
           {error && <p className="form-error" role="alert">{error}</p>}
           <Button type="submit">
             Save booking <Icon name="arrow" />

@@ -501,6 +501,11 @@ input::placeholder, textarea::placeholder { color: #a4a8a1; }
   padding-top: 18px;
   background: linear-gradient(transparent, var(--bg) 30%);
 }
+.sticky-action.has-error {
+  position: static;
+  padding-top: 0;
+  background: transparent;
+}
 .success-page {
   min-height: 70dvh;
   align-items: center;
