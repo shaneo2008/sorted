@@ -1,21 +1,28 @@
 import { Outlet, NavLink } from "react-router-dom";
+import { Icon } from "./components";
 
-/**
- * Mobile-first shell: content + bottom tab bar + a big centre "+" that goes
- * straight to Add Booking — the whole product is that button being fast.
- * TODO(M1): auth gate — redirect to /login when no JWT in storage.
- */
 export function AppShell() {
   return (
     <div className="shell">
       <main className="content">
         <Outlet />
       </main>
-      <nav className="tabbar">
-        <NavLink to="/" end>Today</NavLink>
-        <NavLink to="/bookings/new" className="fab" aria-label="Add booking">＋</NavLink>
-        <NavLink to="/money">Money</NavLink>
-        <NavLink to="/expenses">Expenses</NavLink>
+      <nav className="tabbar" aria-label="Main navigation">
+        <NavLink to="/" end>
+          <Icon name="calendar" />
+          <span>Today</span>
+        </NavLink>
+        <NavLink to="/bookings/new" className="fab" aria-label="Add booking">
+          <Icon name="plus" size={28} />
+        </NavLink>
+        <NavLink to="/money">
+          <Icon name="wallet" />
+          <span>Money</span>
+        </NavLink>
+        <NavLink to="/expenses">
+          <Icon name="receipt" />
+          <span>Expenses</span>
+        </NavLink>
       </nav>
     </div>
   );

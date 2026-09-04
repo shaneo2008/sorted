@@ -1,5 +1,12 @@
 import { Hono } from "hono";
-import { CreateExpenseInput, ConfirmExpenseInput } from "@sorted/core";
+import { and, desc, eq, gte, lt } from "drizzle-orm";
+import {
+  ConfirmExpenseInput,
+  CreateExpenseInput,
+  ExpenseCategory,
+  ExpenseStatus,
+} from "@sorted/core";
+import { db, schema } from "../db";
 import type { AppEnv } from "../app";
 
 export const expenseRoutes = new Hono<AppEnv>();
@@ -16,35 +23,95 @@ expenseRoutes.post("/upload-url", async (c) => {
 });
 
 /**
- * POST /api/expenses — create with OCR suggestions.
- * TODO(M5):
- *   1. CreateExpenseInput.safeParse
- *   2. Insert row status=needs_review with whatever fields were given
- *   3. If receipt_key present: fetch image from S3, call vision model
- *      (Anthropic API, single message with base64 image, prompt: extract
- *      merchant, total incl. VAT in cents, date, best-fit category from the
- *      ExpenseCategory enum; respond ONLY with JSON). Store full response in
- *      ocrRaw, write suggestions into the nullable columns.
- *   4. Return the expense — the app shows a confirm screen.
- *   Never auto-confirm: OCR guesses must not silently become tax records.
+ * POST /api/expenses — create a reviewable expense.
+ * A future OCR integration can fetch receipt images from S3, call a vision model,
+ * and write suggestions into the nullable columns. OCR guesses must never
+ * silently become tax records.
  */
 expenseRoutes.post("/", async (c) => {
-  void CreateExpenseInput;
-  return c.json({ error: "Not implemented (M5)" }, 501);
+  const parsed = CreateExpenseInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  const input = parsed.data;
+  const [expense] = await db
+    .insert(schema.expenses)
+    .values({
+      userId: c.get("userId"),
+      receiptKey: input.receipt_key,
+      merchant: input.merchant,
+      amountCents: input.amount_cents,
+      category: input.category,
+      expenseDate: input.expense_date,
+      status: "needs_review",
+    })
+    .returning();
+  return c.json(expense, 201);
 });
 
 /** GET /api/expenses?year=&category=&status= */
 expenseRoutes.get("/", async (c) => {
-  // TODO(M5): scoped list, expenseDate desc, filters optional.
-  return c.json({ error: "Not implemented (M5)" }, 501);
+  const { year, category, status } = c.req.query();
+  const conditions = [eq(schema.expenses.userId, c.get("userId"))];
+  if (year) {
+    const parsedYear = Number(year);
+    if (!Number.isInteger(parsedYear)) return c.json({ error: "Invalid year" }, 400);
+    conditions.push(
+      gte(schema.expenses.expenseDate, new Date(`${parsedYear}-01-01T00:00:00Z`)),
+      lt(schema.expenses.expenseDate, new Date(`${parsedYear + 1}-01-01T00:00:00Z`)),
+    );
+  }
+  if (category) {
+    const parsedCategory = ExpenseCategory.safeParse(category);
+    if (!parsedCategory.success) return c.json({ error: "Invalid category" }, 400);
+    conditions.push(eq(schema.expenses.category, parsedCategory.data));
+  }
+  if (status) {
+    const parsedStatus = ExpenseStatus.safeParse(status);
+    if (!parsedStatus.success) return c.json({ error: "Invalid status" }, 400);
+    conditions.push(eq(schema.expenses.status, parsedStatus.data));
+  }
+  const expenses = await db
+    .select()
+    .from(schema.expenses)
+    .where(and(...conditions))
+    .orderBy(desc(schema.expenses.expenseDate));
+  return c.json(expenses);
 });
 
 /** PATCH /api/expenses/:id — user confirms/corrects OCR → status=confirmed */
 expenseRoutes.patch("/:id", async (c) => {
-  void ConfirmExpenseInput;
-  return c.json({ error: "Not implemented (M5)" }, 501);
+  const parsed = ConfirmExpenseInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  const input = parsed.data;
+  const [expense] = await db
+    .update(schema.expenses)
+    .set({
+      merchant: input.merchant,
+      amountCents: input.amount_cents,
+      category: input.category,
+      expenseDate: input.expense_date,
+      status: "confirmed",
+    })
+    .where(
+      and(
+        eq(schema.expenses.id, c.req.param("id")),
+        eq(schema.expenses.userId, c.get("userId")),
+      ),
+    )
+    .returning();
+  if (!expense) return c.json({ error: "Expense not found" }, 404);
+  return c.json(expense);
 });
 
 expenseRoutes.delete("/:id", async (c) => {
-  return c.json({ error: "Not implemented (M5)" }, 501);
+  const [expense] = await db
+    .delete(schema.expenses)
+    .where(
+      and(
+        eq(schema.expenses.id, c.req.param("id")),
+        eq(schema.expenses.userId, c.get("userId")),
+      ),
+    )
+    .returning();
+  if (!expense) return c.json({ error: "Expense not found" }, 404);
+  return c.body(null, 204);
 });

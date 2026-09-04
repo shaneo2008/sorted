@@ -5,11 +5,27 @@ import { env } from "./env";
 const secret = () => new TextEncoder().encode(env.jwtSecret());
 
 export async function issueJwt(userId: string): Promise<string> {
-  return new SignJWT({ sub: userId })
+  return new SignJWT({ sub: userId, purpose: "session" })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
     .setExpirationTime("30d")
     .sign(secret());
+}
+
+export async function issueMagicLinkToken(userId: string): Promise<string> {
+  return new SignJWT({ sub: userId, purpose: "magic-link" })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime("15m")
+    .sign(secret());
+}
+
+export async function verifyMagicLinkToken(token: string): Promise<string> {
+  const { payload } = await jwtVerify(token, secret());
+  if (payload.purpose !== "magic-link" || !payload.sub) {
+    throw new Error("Invalid magic link");
+  }
+  return String(payload.sub);
 }
 
 /** Sets c.get("userId") or returns 401. Applied to all /api/* routes. */
@@ -21,6 +37,9 @@ export const requireAuth: MiddlewareHandler<{
   if (!token) return c.json({ error: "Unauthorized" }, 401);
   try {
     const { payload } = await jwtVerify(token, secret());
+    if (payload.purpose !== "session") {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
     c.set("userId", String(payload.sub));
     await next();
   } catch {

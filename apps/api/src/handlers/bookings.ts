@@ -7,14 +7,17 @@
  *   3. Emit a domain event if something automation-worthy happened
  *   4. Return the row(s) — no wrapper envelopes, errors as { error }
  *
- * `create` and `confirm` are complete. list/get/patch/complete/cancel are
- * left as guided TODOs (M1/M2) — copy the shapes you see here.
+ * All booking routes follow the same edge-validation and user-scoping pattern.
  */
 import { Hono } from "hono";
-import { and, eq, gte, lte, desc } from "drizzle-orm";
-import { CreateBookingInput, UpdateBookingInput } from "@sorted/core";
+import { and, eq, gte, lte, desc, sql } from "drizzle-orm";
+import {
+  BookingStatus,
+  CreateBookingInput,
+  UpdateBookingInput,
+} from "@sorted/core";
 import { db, schema } from "../db";
-import { emitEvent } from "../lib/events";
+import { emitBookingEvent, emitEvent } from "../lib/events";
 import type { AppEnv } from "../app";
 
 export const bookingRoutes = new Hono<AppEnv>();
@@ -27,8 +30,11 @@ bookingRoutes.get("/", async (c) => {
   const conditions = [eq(schema.bookings.userId, userId)];
   if (from) conditions.push(gte(schema.bookings.startAt, new Date(from)));
   if (to) conditions.push(lte(schema.bookings.startAt, new Date(to)));
-  if (status)
-    conditions.push(eq(schema.bookings.status, status as never)); // TODO(M1): validate against BookingStatus enum
+  if (status) {
+    const parsedStatus = BookingStatus.safeParse(status);
+    if (!parsedStatus.success) return c.json({ error: "Invalid status" }, 400);
+    conditions.push(eq(schema.bookings.status, parsedStatus.data));
+  }
 
   const rows = await db
     .select({
@@ -166,37 +172,184 @@ bookingRoutes.post("/:id/confirm", async (c) => {
 
 /** GET /api/bookings/:id — booking + client + payments + message log */
 bookingRoutes.get("/:id", async (c) => {
-  // TODO(M1): fetch booking (scoped by userId, 404 if missing), then its
-  // client, payments, and messageLog rows. Return one composed object.
-  // Pattern: three awaited selects is fine at this scale — skip the mega-join.
-  return c.json({ error: "Not implemented (M1)" }, 501);
+  const userId = c.get("userId");
+  const id = c.req.param("id");
+  const [row] = await db
+    .select({ booking: schema.bookings, client: schema.clients })
+    .from(schema.bookings)
+    .innerJoin(schema.clients, eq(schema.bookings.clientId, schema.clients.id))
+    .where(
+      and(eq(schema.bookings.id, id), eq(schema.bookings.userId, userId)),
+    );
+  if (!row) return c.json({ error: "Booking not found" }, 404);
+  const [payments, messages] = await Promise.all([
+    db
+      .select()
+      .from(schema.payments)
+      .where(
+        and(
+          eq(schema.payments.bookingId, id),
+          eq(schema.payments.userId, userId),
+        ),
+      )
+      .orderBy(desc(schema.payments.createdAt)),
+    db
+      .select()
+      .from(schema.messageLog)
+      .where(
+        and(
+          eq(schema.messageLog.bookingId, id),
+          eq(schema.messageLog.userId, userId),
+        ),
+      )
+      .orderBy(desc(schema.messageLog.sentAt)),
+  ]);
+  return c.json({ ...row, payments, messages });
 });
 
 /** PATCH /api/bookings/:id */
 bookingRoutes.patch("/:id", async (c) => {
-  // TODO(M1): UpdateBookingInput.safeParse → db.update scoped by id+userId.
-  // Map snake_case input fields to camelCase columns (see create above).
-  // If start_at changed on a confirmed booking, emit booking.confirmed again?
-  // No — add a booking.rescheduled event later if beta users need it. For now
-  // just update; the reminder cron reads startAt fresh anyway.
-  void UpdateBookingInput;
-  return c.json({ error: "Not implemented (M1)" }, 501);
+  const parsed = UpdateBookingInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  const input = parsed.data;
+  const [current] = await db
+    .select()
+    .from(schema.bookings)
+    .where(
+      and(
+        eq(schema.bookings.id, c.req.param("id")),
+        eq(schema.bookings.userId, c.get("userId")),
+      ),
+    );
+  if (!current) return c.json({ error: "Booking not found" }, 404);
+  const priceCents = input.price_cents ?? current.priceCents;
+  const depositCents = input.deposit_cents ?? current.depositCents;
+  if (depositCents > priceCents) {
+    return c.json({ error: "Deposit cannot exceed price" }, 400);
+  }
+  const [booking] = await db
+    .update(schema.bookings)
+    .set({
+      service: input.service,
+      startAt: input.start_at,
+      endAt: input.end_at,
+      priceCents: input.price_cents,
+      depositCents: input.deposit_cents,
+      location: input.location,
+      notes: input.notes,
+    })
+    .where(eq(schema.bookings.id, current.id))
+    .returning();
+  return c.json(booking);
 });
 
 /** POST /api/bookings/:id/complete — confirmed → completed */
 bookingRoutes.post("/:id/complete", async (c) => {
-  // TODO(M2): mirror /confirm exactly, except:
-  //  - valid transition: confirmed → completed
-  //  - create a "balance" payment row for (priceCents − sum of paid payments)
-  //    if that remainder is > 0
-  //  - emit "booking.completed" with the payment included
-  return c.json({ error: "Not implemented (M2)" }, 501);
+  const userId = c.get("userId");
+  const id = c.req.param("id");
+  const [booking] = await db
+    .select()
+    .from(schema.bookings)
+    .where(
+      and(eq(schema.bookings.id, id), eq(schema.bookings.userId, userId)),
+    );
+  if (!booking) return c.json({ error: "Booking not found" }, 404);
+  if (booking.status !== "confirmed") {
+    return c.json(
+      { error: `Cannot complete a booking in status '${booking.status}'` },
+      409,
+    );
+  }
+
+  const [expected] = await db
+    .select({
+      amount: sql<number>`coalesce(sum(${schema.payments.amountCents}), 0)`,
+    })
+    .from(schema.payments)
+    .where(
+      and(
+        eq(schema.payments.bookingId, id),
+        eq(schema.payments.userId, userId),
+        eq(schema.payments.status, "paid"),
+      ),
+    );
+  const paidCents = Number(expected?.amount ?? 0);
+  const remainder = Math.max(booking.priceCents - paidCents, 0);
+  await db
+    .update(schema.payments)
+    .set({ status: "cancelled" })
+    .where(
+      and(
+        eq(schema.payments.bookingId, id),
+        eq(schema.payments.userId, userId),
+        eq(schema.payments.status, "pending"),
+      ),
+    );
+  let payment: typeof schema.payments.$inferSelect | undefined;
+  if (remainder > 0) {
+    [payment] = await db
+      .insert(schema.payments)
+      .values({
+        userId,
+        bookingId: id,
+        kind: paidCents > 0 ? "balance" : "full",
+        amountCents: remainder,
+      })
+      .returning();
+  }
+  const [completed] = await db
+    .update(schema.bookings)
+    .set({ status: "completed", completedAt: new Date() })
+    .where(eq(schema.bookings.id, id))
+    .returning();
+  await emitBookingEvent(
+    userId,
+    id,
+    "booking.completed",
+    payment
+      ? {
+          id: payment.id,
+          kind: payment.kind,
+          amountCents: payment.amountCents,
+          linkUrl: payment.linkUrl,
+        }
+      : undefined,
+  );
+  return c.json({ booking: completed, payment: payment ?? null });
 });
 
 /** POST /api/bookings/:id/cancel */
 bookingRoutes.post("/:id/cancel", async (c) => {
-  // TODO(M1): any non-completed status → cancelled; also cancel pending
-  // payments for this booking; emit "booking.cancelled" (n8n deletes gcal
-  // event using booking.gcal_event_id).
-  return c.json({ error: "Not implemented (M1)" }, 501);
+  const userId = c.get("userId");
+  const id = c.req.param("id");
+  const [booking] = await db
+    .select()
+    .from(schema.bookings)
+    .where(
+      and(eq(schema.bookings.id, id), eq(schema.bookings.userId, userId)),
+    );
+  if (!booking) return c.json({ error: "Booking not found" }, 404);
+  if (booking.status === "completed" || booking.status === "cancelled") {
+    return c.json(
+      { error: `Cannot cancel a booking in status '${booking.status}'` },
+      409,
+    );
+  }
+  await db
+    .update(schema.payments)
+    .set({ status: "cancelled" })
+    .where(
+      and(
+        eq(schema.payments.bookingId, id),
+        eq(schema.payments.userId, userId),
+        eq(schema.payments.status, "pending"),
+      ),
+    );
+  const [cancelled] = await db
+    .update(schema.bookings)
+    .set({ status: "cancelled" })
+    .where(eq(schema.bookings.id, id))
+    .returning();
+  await emitBookingEvent(userId, id, "booking.cancelled");
+  return c.json(cancelled);
 });

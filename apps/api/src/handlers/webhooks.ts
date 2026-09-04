@@ -1,10 +1,15 @@
 import { Hono } from "hono";
+import { eq } from "drizzle-orm";
+import Stripe from "stripe";
+import { db, schema } from "../db";
+import { emitBookingEvent } from "../lib/events";
+import { env } from "../lib/env";
 
 export const webhookRoutes = new Hono();
 
 /**
  * POST /api/webhooks/stripe
- * TODO(M2):
+ * Checkout completion flow:
  *   1. const sig = c.req.header("stripe-signature")
  *   2. stripe.webhooks.constructEvent(await c.req.text(), sig,
  *      env.stripeWebhookSecret()) — MUST use the raw text body
@@ -16,5 +21,59 @@ export const webhookRoutes = new Hono();
  * Local testing: `stripe listen --forward-to localhost:3001/api/webhooks/stripe`
  */
 webhookRoutes.post("/stripe", async (c) => {
-  return c.json({ error: "Not implemented (M2)" }, 501);
+  const key = env.stripeKey();
+  const webhookSecret = env.stripeWebhookSecret();
+  const signature = c.req.header("stripe-signature");
+  if (!key || !webhookSecret) {
+    return c.json({ error: "Stripe webhook is not configured" }, 503);
+  }
+  if (!signature) return c.json({ error: "Missing Stripe signature" }, 400);
+
+  const stripe = new Stripe(key);
+  let event: Stripe.Event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      await c.req.text(),
+      signature,
+      webhookSecret,
+    );
+  } catch {
+    return c.json({ error: "Invalid Stripe signature" }, 400);
+  }
+
+  if (event.type !== "checkout.session.completed") {
+    return c.json({ received: true });
+  }
+  const session = event.data.object;
+  let paymentId = session.metadata?.payment_id;
+  if (!paymentId && typeof session.payment_intent === "string") {
+    const intent = await stripe.paymentIntents.retrieve(session.payment_intent);
+    paymentId = intent.metadata.payment_id;
+  }
+  if (!paymentId) return c.json({ received: true });
+
+  const [current] = await db
+    .select()
+    .from(schema.payments)
+    .where(eq(schema.payments.id, paymentId));
+  if (!current || current.status === "paid") {
+    return c.json({ received: true });
+  }
+  const [payment] = await db
+    .update(schema.payments)
+    .set({ status: "paid", method: "stripe", paidAt: new Date() })
+    .where(eq(schema.payments.id, paymentId))
+    .returning();
+  await emitBookingEvent(
+    payment.userId,
+    payment.bookingId,
+    "payment.paid",
+    {
+      id: payment.id,
+      kind: payment.kind,
+      amountCents: payment.amountCents,
+      linkUrl: payment.linkUrl,
+    },
+  );
+  return c.json({ received: true });
 });
