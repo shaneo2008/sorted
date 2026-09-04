@@ -495,7 +495,10 @@ input::placeholder, textarea::placeholder { color: #a4a8a1; }
   position: sticky;
   z-index: 4;
   bottom: 86px;
-  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 18px;
   background: linear-gradient(transparent, var(--bg) 30%);
 }
 .success-page {

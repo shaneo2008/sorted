@@ -234,8 +234,8 @@ export function AddBooking() {
             </>
           )}
         </Card>
-        {error && <p className="form-error" role="alert">{error}</p>}
         <div className="sticky-action">
+          {error && <p className="form-error" role="alert">{error}</p>}
           <Button type="submit">
             Save booking <Icon name="arrow" />
           </Button>
